@@ -17,7 +17,7 @@ import openpyxl as _openpyxl
 from datetime import datetime
 from sqlalchemy import select
 from packaging.version import Version
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Callable, Optional
 from sqlalchemy import update as sql_update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from pydantic_ai import Agent
@@ -40,10 +40,12 @@ from .db.session import Database
 from .agent import AgentManager, EchoProvider
 from .system_info import SystemInformationService
 from .stream_events import (
-  TextDelta, ToolCallStarted, ToolCallResult, ApprovalRequest, ApprovalResolved, StreamEvent,
+  TextDelta, ToolCallStarted, ToolCallResult, ApprovalRequest, ApprovalResolved,
+  StreamEvent, TurnUsage, strip_attached_context,
 )
 from .tools import classify_operation
 from .desktop_tools import ToolRegistry, EngineContext
+from .dispatch import ProviderTable, build_provider_tools, filter_local_tools_for_providers
 from .db.models import (
   Workspace, Thread, Message, AppState, Networks,
   SkillRegistry, ToolRegistry as ToolRegistryModel,
@@ -52,6 +54,50 @@ from .db.models import (
 
 # Logging setup
 logger = logging.getLogger("subconscious")
+
+
+# Field-name pairs pydantic-ai has used for prompt/completion token counts across
+# versions; the first present (and non-None) wins.
+_USAGE_INPUT_FIELDS = ("input_tokens", "request_tokens", "prompt_tokens")
+_USAGE_OUTPUT_FIELDS = ("output_tokens", "response_tokens", "completion_tokens")
+
+
+def _read_usage_field(usage: Any, names: tuple[str, ...]) -> int:
+  """Read the first present integer field from *usage* out of *names*, else 0."""
+  for name in names:
+    value = getattr(usage, name, None)
+    if isinstance(value, (int, float)):
+      return int(value)
+  return 0
+
+
+def _accumulate_run_usage(totals: dict, run: Any) -> None:
+  """Fold one ``agent.iter()`` pass's token usage into *totals*.
+
+  Read defensively: usage reporting is provider-dependent (a local/echo model may
+  report nothing) and pydantic-ai has renamed these fields between versions, so a
+  missing or differently-named counter degrades to 0 rather than breaking the turn.
+  """
+  try:
+    usage = run.usage() if callable(getattr(run, "usage", None)) else None
+    if usage is None:
+      result = getattr(run, "result", None)
+      usage = result.usage() if callable(getattr(result, "usage", None)) else None
+    if usage is None:
+      return
+
+    input_tokens = _read_usage_field(usage, _USAGE_INPUT_FIELDS)
+    output_tokens = _read_usage_field(usage, _USAGE_OUTPUT_FIELDS)
+    total_tokens = _read_usage_field(usage, ("total_tokens",))
+    requests = _read_usage_field(usage, ("requests",))
+
+    totals["input_tokens"] += input_tokens
+    totals["output_tokens"] += output_tokens
+    # Prefer the provider's own total; fall back to the parts when it isn't reported.
+    totals["total_tokens"] += total_tokens or (input_tokens + output_tokens)
+    totals["requests"] += requests or 1
+  except Exception:
+    logger.debug("could not read run usage", exc_info=True)
 
 
 class Engine:
@@ -164,16 +210,37 @@ class Engine:
     # register the callback that keeps it fresh on later updates (Req 7.5).
     await self._seed_share_system_context()
 
+  @staticmethod
+  def _as_bool(value: Optional[object], default: bool = True) -> bool:
+    """Coerce a stored setting value to a bool, falling back to ``default``.
+
+    ``bool`` inputs pass through unchanged. ``None`` and any string that
+    isn't a recognized truthy/falsey token (case-insensitive, surrounding
+    whitespace ignored) fall back to ``default`` rather than raising, so a
+    malformed stored value never breaks the in-memory cache.
+    """
+    if isinstance(value, bool):
+      return value
+    if value is None:
+      return default
+    normalized = str(value).strip().lower()
+    if normalized in ("true", "1", "yes", "on"):
+      return True
+    if normalized in ("false", "0", "no", "off"):
+      return False
+    return default
+
   async def _seed_share_system_context(self) -> None:
     """ Seed the _share_system_context cache from AppState and register the
     update callback.
 
     A failed read leaves the cache at its default (True) and a malformed stored
+    value is coerced to the default via `_as_bool`. The callback is
     registered regardless so later updates always refresh the cache.
     """
     try:
       stored = await self.get_setting("share_system_context", tag="system")
-      self._share_system_context = stored == "true"
+      self._share_system_context = self._as_bool(stored, default=True)
     except Exception as exc:
       logger.warning(f"Failed to seed share_system_context; using default (True): {exc}")
       self._share_system_context = True
@@ -183,31 +250,42 @@ class Engine:
 
   async def _on_share_system_context_changed(self, key: str, value: str, tag: str) -> None:
     """ Setting callback: refresh the in-memory share_system_context cache """
-    self._share_system_context = value == "true"
+    self._share_system_context = self._as_bool(value, default=True)
 
-  async def _collect_info(self) -> None:
-    """ Initiates the hardware information collection service """
+  async def _init_system_info(self) -> None:
+    """Create the SystemInformationService and run its one-time load-or-collect.
+
+    Guarded so a failure constructing the service or resolving the profile
+    (``ensure_profile``) is logged and leaves ``system_info`` as ``None``
+    rather than propagating and aborting startup (Requirement 8.3). The
+    (possibly slow) collection runs off the event loop via a worker thread so
+    it never blocks the rest of startup.
+    """
     try:
       self.system_info = SystemInformationService(data_dir=str(self.config.data_dir))
-      # Fast, non-blocking: serve last-known data (or an UNKNOWN placeholder).
-      self.system_info.load_cached_profile()
-
-      # Refresh in the background so a slow collection never blocks startup.
-      asyncio.create_task(self._refresh_system_info())
+      await asyncio.to_thread(self.system_info.ensure_profile)
     except Exception as exc:
       logger.error(
         f"System information initialization failed; continuing without it: {exc}"
       )
       self.system_info = None
 
-  async def _refresh_system_info(self) -> None:
-    """ Run the (potentially slow) system-info collection off the event loop """
-    if self.system_info is None: return
+  async def _resolve_ambient_context(self) -> Optional[str]:
+    """Return the formatted ambient system-information context, or None.
+
+    The context is only returned when the ``share_system_context`` privacy
+    toggle is enabled and a system-info service is available (Requirements
+    6.1, 7.4). The whole body is guarded so any failure logs and returns
+    ``None`` rather than propagating, keeping chat working even if
+    formatting breaks (Requirements 8.1, 8.2).
+    """
+    if not self._share_system_context or self.system_info is None:
+      return None
     try:
-      await asyncio.to_thread(self.system_info.refresh)
-      logger.debug("System information refreshed in background")
+      return self.system_info.format_ambient_context()
     except Exception as exc:
-      logger.warning(f"Background system-info refresh failed: {exc}")
+      logger.error(f"Failed to resolve ambient system context: {exc}")
+      return None
 
   async def init_system(self):
     """ Initialize system components (DB, Default Workspace) """
@@ -298,7 +376,7 @@ class Engine:
     await self.init_system()
 
     # Collect the hardware info
-    await self._collect_info()
+    await self._init_system_info()
 
     # Check for updates
     asyncio.create_task(self.check_for_updates())
@@ -359,8 +437,11 @@ class Engine:
         if thread:
           return thread
 
-      # Auto-generate a short title from the first few words
-      words = content.strip().split()
+      # Auto-generate a short title from the first few words of what the USER wrote —
+      # any attached file/folder context is inlined ahead of their message, so it is
+      # stripped first (otherwise a message with an attachment is named after the
+      # attachment preamble, e.g. "[Context - File.", rather than the request).
+      words = strip_attached_context(content).split()
       title = " ".join(words[:6])
       if len(words) > 6:
         title += "…"
@@ -452,10 +533,25 @@ class Engine:
     attachments: Optional[list[dict]] = None,
     enabled_tools: Optional[list[str]] = None,
     auto_approve: Optional[bool] = None,
+    tool_dispatch: Optional[Callable] = None,
+    provider_table: Optional[ProviderTable] = None,
+    context_blocks: Optional[list[str]] = None,
   ) -> AsyncIterator[StreamEvent]:
     """
     Stream a *structured* AI response for *content* given the thread history.
 
+    `provider_table` is the turn's snapshot of currently-connected Providers
+    (single-engine-architecture spec); when it offers any tools, those are
+    bridged into agent-callable tools (Requirement: connected-client tool
+    precedence) and take priority over same-named local built-ins, so an IDE
+    extension's workspace-scoped `create_file`/`edit_file`/etc. is what the
+    model actually calls instead of the engine's own unsandboxed equivalents.
+
+    `context_blocks` carries already-resolved context the client attached to this
+    turn (e.g. the VS Code extension's "#" file/folder/terminal mentions). It is
+    prepended to the MODEL PROMPT ONLY and is never part of the persisted user
+    message, so the chat transcript shows what the user actually typed rather than
+    the full inlined contents of every attachment.
     """
     # Load history (excluding the message we're about to send – it was just saved)
     db_messages = await self.load_thread_messages(thread_id)
@@ -477,27 +573,22 @@ class Engine:
       # defaults) and build the enabled callables from it.
       cfg = await self.resolve_tools_config(workspace_id, thread_id)
       tools = self.tool_registry.get_tools_for_config(cfg)
-    
 
-    ambient_context = (
-      self.system_info.format_ambient_context()
-      if self._share_system_context and self.system_info is not None
-      else None
-    )
+    # Provider-tool bridge (single-engine-architecture spec): give every
+    # tool id a connected client currently advertises an agent-callable Tool
+    # that routes through `tool_dispatch`, and drop any local built-in whose
+    # name collides with one — the connected client's (e.g. the VS Code
+    # extension's) workspace-scoped tool wins over the engine's own local
+    # equivalent for this turn.
+    tools = filter_local_tools_for_providers(tools, provider_table)
+    if provider_table is not None:
+      tools = [*tools, *build_provider_tools(provider_table)]
+
+    ambient_context = await self._resolve_ambient_context()
     agent = self.agent_manager.build_agent(
       model_cfg,
       tools=tools,
       ambient_context=ambient_context,
-    )
-
-    # Build the dependency context for tools that need DB / workspace access
-    ctx_deps = EngineContext(
-      db=self.db,
-      workspace_id=workspace_id or 0,
-      thread_id=thread_id,
-      engine=self,
-      data_dir=str(self.config.data_dir),
-      approval_config=await self.resolve_approval_config(workspace_id, thread_id),
     )
 
     # ---- Fit everything within the model's context window ------------------
@@ -509,22 +600,32 @@ class Engine:
     system_prompt = (model_cfg.get("system_prompt") or "") if model_cfg else ""
     input_budget = self._input_token_budget(model_cfg, system_prompt, ambient_context)
 
+    # Client-supplied context (the extension's resolved "#" mentions) is part of the
+    # prompt the model sees, so it must be counted against the same input budget as
+    # the user's own text — but it is never persisted as part of the user message.
+    prompt_content = self._with_context_blocks(content, context_blocks)
+
     # Reserve up to ~60% of the input budget for the new prompt + attachments;
     # the user's own message is always kept in full.
-    attachment_token_budget = max(0, int(input_budget * 0.6) - self._estimate_tokens(content))
+    attachment_token_budget = max(
+      0, int(input_budget * 0.6) - self._estimate_tokens(prompt_content)
+    )
     prompt = self._build_prompt_with_attachments(
-      content, attachments or [], char_budget=attachment_token_budget * self._CHARS_PER_TOKEN
+      prompt_content, attachments or [], char_budget=attachment_token_budget * self._CHARS_PER_TOKEN
     )
 
     # Remaining budget goes to conversation history (trim oldest-first to fit).
     history_budget = max(0, input_budget - self._estimate_tokens(prompt))
     history = self._fit_history_to_budget(history, history_budget)
 
-    # Stream with an inactivity timeout. `asyncio.timeout` bounds the wait for
+    # Stream with an inactivity timeout. `asyncio.timeout` bounds how long we wait
+    # for THE MODEL to produce its next token/event — it is deliberately NOT a bound
+    # on tool execution (see the tool-call handling below, which disables the timeout
+    # while tool calls are in flight): a legitimately slow tool (a build, a test run,
+    # a command awaiting human approval) must never be mistaken for a stalled model.
     #
-    # We drive the full agent graph with `agent.iter()` rather than
-    timeout_s = self._resolve_stream_timeout(model_cfg)
-    loop = asyncio.get_running_loop()
+    # We drive the full agent graph with `agent.iter()` rather than `run_stream` so
+    # tool calls and approval-gated (HITL) pauses surface as discrete events.
     timeout_s = self._resolve_stream_timeout(model_cfg)
     loop = asyncio.get_running_loop()
 
@@ -543,6 +644,23 @@ class Engine:
         ) from exc
       return
 
+    # Build the dependency context for tools that need DB / workspace access.
+    # Deferred until now (after the echo-agent short-circuit) so the dev-only
+    # echo path never touches the DB-backed approval config.
+    ctx_deps = EngineContext(
+      db=self.db,
+      workspace_id=workspace_id or 0,
+      thread_id=thread_id,
+      engine=self,
+      data_dir=str(self.config.data_dir),
+      approval_config=await self.resolve_approval_config(workspace_id, thread_id),
+      # Provider_Table-backed dispatcher for this turn (single-engine
+      # architecture, task 11.2). When the turn originates from a WebSocket
+      # `chat.send`, this routes tool calls to the resolved Provider via
+      # `ToolDispatcher.call` instead of the legacy direct single-client path.
+      tool_dispatch=tool_dispatch,
+    )
+
     # Real agent: drive the full graph. When the model calls a tool that the
     # approval policy gates, the run ends with a DeferredToolRequests output
     # instead of executing it; we surface an ApprovalRequest, wait for the
@@ -551,9 +669,26 @@ class Engine:
     deferred_results: Optional[DeferredToolResults] = None
     message_history = history
     user_prompt: Optional[str] = prompt
+    # Token usage accumulated across every `agent.iter()` pass this turn makes (a
+    # tool-calling or approval-gated turn runs the graph more than once), reported as
+    # a single TurnUsage event at the end so the client can footnote the turn.
+    usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "requests": 0}
     while True:
+      # Number of tool calls currently executing. The inactivity timeout bounds the
+      # wait for the MODEL only, so it is suspended entirely while any tool call is
+      # in flight and re-armed once they have all returned (see `_arm`/`_disarm`).
+      tools_in_flight = 0
       try:
         async with asyncio.timeout(timeout_s) as stream_timeout:
+
+          def _arm() -> None:
+            """(Re-)arm the model inactivity deadline."""
+            stream_timeout.reschedule(loop.time() + timeout_s)
+
+          def _disarm() -> None:
+            """Suspend the inactivity deadline (no bound on how long we wait)."""
+            stream_timeout.reschedule(None)
+
           async with agent.iter(  # type: ignore[call-overload]
             user_prompt,
             message_history=message_history,
@@ -571,21 +706,36 @@ class Engine:
                     elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
                       delta = event.delta.content_delta
                     if delta:
-                      stream_timeout.reschedule(loop.time() + timeout_s)
+                      _arm()
                       yield TextDelta(content=delta)
               elif Agent.is_call_tools_node(node):
                 # Surface each tool call and its result as discrete events so
                 # the UI can render them as their own bubbles.
+                #
+                # The inactivity timeout MUST NOT apply while a tool runs: a tool
+                # call can legitimately take far longer than any model would (a
+                # build, a test suite, a terminal command sitting on a human
+                # approval prompt), and the wait for its result happens right here
+                # inside this `async for`. Timing that out would kill the whole turn
+                # — losing the tool's output and everything the model would have
+                # said next — and misreport it as "the model did not respond".
+                # So: disable the deadline while any call is in flight and re-arm it
+                # only once every call has returned and we're waiting on the model
+                # again.
                 async with node.stream(run.ctx) as tool_stream:
                   async for event in tool_stream:
-                    stream_timeout.reschedule(loop.time() + timeout_s)
                     if isinstance(event, FunctionToolCallEvent):
+                      tools_in_flight += 1
+                      _disarm()
                       yield ToolCallStarted(
                         tool_name=event.part.tool_name,
                         args=event.part.args,
                         tool_call_id=event.part.tool_call_id,
                       )
                     elif isinstance(event, FunctionToolResultEvent):
+                      tools_in_flight = max(0, tools_in_flight - 1)
+                      if tools_in_flight == 0:
+                        _arm()
                       result = event.result
                       yield ToolCallResult(
                         tool_name=getattr(result, "tool_name", "") or "",
@@ -593,11 +743,26 @@ class Engine:
                         tool_call_id=event.tool_call_id,
                         outcome=getattr(result, "outcome", "success"),
                       )
+                    else:
+                      # Any other tool-node activity is still progress; only extend
+                      # the deadline when nothing is executing, so an in-flight tool
+                      # is never accidentally re-armed onto a deadline.
+                      if tools_in_flight == 0:
+                        _arm()
+                # Leaving the tool node: nothing can still be executing, so make
+                # sure the deadline is armed again for the next model request even
+                # if the call/result events didn't balance.
+                tools_in_flight = 0
+                _arm()
       except asyncio.TimeoutError as exc:
         raise TimeoutError(
           f"The model did not respond within {timeout_s:.0f}s of inactivity. "
           "The provider may be unavailable or stalled."
         ) from exc
+
+      # Fold this pass's token usage into the turn totals before deciding whether to
+      # loop again, so an approval-gated turn still reports what it has spent so far.
+      _accumulate_run_usage(usage_totals, run)
 
       # If the model called any approval-gated tools, the run paused here.
       output = getattr(run.result, "output", None)
@@ -630,6 +795,9 @@ class Engine:
         user_prompt = None
         continue
       break
+
+    # Last event of the turn: what it cost, for the client's end-of-turn footnote.
+    yield TurnUsage(**usage_totals)
 
   async def stream_chat(
     self,
@@ -780,6 +948,28 @@ class Engine:
         dropped, budget_tokens,
       )
     return list(reversed(kept_reversed))
+
+  def _with_context_blocks(
+    self, content: str, context_blocks: Optional[list[str]]
+  ) -> str:
+    """ Prepend client-resolved context blocks to the model prompt.
+
+        Used for context a client attached to the turn (the VS Code extension's "#"
+        file/folder/terminal/problems mentions), which arrives already rendered as
+        text. This affects ONLY what the model is prompted with — the persisted user
+        message stays exactly what the user typed, so the transcript isn't flooded
+        with inlined file contents.
+    """
+    blocks = [b for b in (context_blocks or []) if isinstance(b, str) and b.strip()]
+    if not blocks:
+      return content
+    return (
+      "The user attached the following context to this message. "
+      "Use it to answer their request.\n\n"
+      + "\n\n".join(blocks)
+      + "\n\n---\n\n"
+      + content
+    )
 
   def _build_prompt_with_attachments(
     self, content: str, attachments: list[dict], char_budget: Optional[int] = None

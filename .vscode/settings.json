@@ -3,34 +3,9 @@
   // Personal preferences (theme, Copilot, terminal profile, etc.)
   // belong in your VS Code User Settings (Ctrl/Cmd+Shift+P → "Open User Settings").
   "files.associations": { "*.env": "dotenv" },
-  "github.copilot.enable": {
-    "*": false,
-    "plaintext": false,
-    "markdown": false,
-    "scminput": false,
-    "jsonc": true,
-    "dotenv": false,
-    "python": false
-  },
-  "chat.tools.terminal.autoApprove": {
-    "/.*_get_.*/": true,
-    "/.*get.*/": true,
-    "/.*add.*/": true,
-    "/.*_list_.*/": true,
-    "/.*create.*/": false,
-    "/.*_create_.*/": false,
-    "/.*_update_.*/": false,
-    "/.*_delete_.*/": false
-  },
-  // "chat.tools.terminal.terminalProfile.windows": {
-  //   "path": "C:\\WINDOWS\\System32\\cmd.exe"
-  // },
-  "chat.tools.terminal.terminalProfile.windows": {
-    "path": "powershell.exe"
-  },
   "terminal.integrated.shellIntegration.enabled": true,
   "python.terminal.activateEnvInCurrentTerminal": true,
-  "python.terminal.activateEnvironment": true,
+  "python.terminal.activateEnvironment": false,
   "editor.unicodeHighlight.ambiguousCharacters": false,
   "editor.unicodeHighlight.invisibleCharacters": false,
   "workbench.colorCustomizations": {
@@ -45,12 +20,19 @@
     "statusBar.background": "#ffffff",
     "statusBar.foreground": "#15202b",
     "statusBarItem.hoverBackground": "#e6e6e6",
-    "statusBarItem.remoteBackground": "#ffffff",
+    "statusBarItem.remoteBackground": "#df9f9f",
     "statusBarItem.remoteForeground": "#15202b",
     "titleBar.activeBackground": "#ffffff",
     "titleBar.activeForeground": "#15202b",
     "titleBar.inactiveBackground": "#ffffff99",
-    "titleBar.inactiveForeground": "#15202b99"
+    "titleBar.inactiveForeground": "#15202b99",
+    "activityBarTop.activeBackground": "#ffffff",
+    "activityBarTop.background": "#ffffff",
+    "activityBarTop.foreground": "#15202b",
+    "activityBarTop.inactiveForeground": "#15202b99",
+    "commandCenter.foreground": "#15202b",
+    "statusBar.debuggingBackground": "#ffffff",
+    "statusBar.debuggingForeground": "#15202b"
   },
   "peacock.color": "#ffffff",
   "python.testing.pytestArgs": [
@@ -59,34 +41,4 @@
   "python.testing.unittestEnabled": false,
   "python.testing.pytestEnabled": true,
   "chat.agent.maxRequests": 100,
-  "kiroAgent.trustedCommands": [
-    "node *",
-    "npm *",
-    "npx *",
-    "yarn *",
-    "pnpm *",
-    "git status",
-    "git diff",
-    "git log",
-    "git show",
-    "git branch",
-    "git remote",
-    "conda list",
-    "conda info",
-    "conda env list",
-    "dir *",
-    "type *",
-    "echo *",
-    "where *",
-    "whoami",
-    "cmd *",
-    "if exist *",
-    "pip show *",
-    "python *",
-    "Get-ChildItem *",
-    "powershell *",
-    "conda run *",
-    "set *",
-    "conda activate *"
-  ]
 }

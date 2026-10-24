@@ -16,9 +16,12 @@ from subconscious.desktop_tools.images import (
   batch_convert_image,
   batch_optimize_images,
   batch_resize_images,
+  images_to_pdf,
+  pdf_to_images,
   _SCOUR_AVAILABLE,
   _CAIROSVG_AVAILABLE,
   _VTRACER_AVAILABLE,
+  _PYMUPDF_AVAILABLE,
 )
 
 
@@ -913,3 +916,176 @@ async def test_batch_resize_includes_svg(ctx, tmp_dir):
   assert (dest_dir / "icon.svg").exists()
   content = (dest_dir / "icon.svg").read_text()
   assert 'width="150"' in content
+
+
+# ---------------------------------------------------------------------------
+# images_to_pdf
+# ---------------------------------------------------------------------------
+
+async def test_images_to_pdf_single_image(ctx, tmp_dir):
+  input_path = tmp_dir / "test.png"
+  output_path = tmp_dir / "out.pdf"
+  create_test_png(input_path, size=(100, 100))
+
+  result = await images_to_pdf(ctx, [str(input_path)], str(output_path))
+  assert "Successfully combined" in result
+  assert output_path.exists()
+
+  import pypdf
+  reader = pypdf.PdfReader(str(output_path))
+  assert len(reader.pages) == 1
+
+
+async def test_images_to_pdf_multiple_images_preserves_order(ctx, tmp_dir):
+  p1 = tmp_dir / "a.png"
+  p2 = tmp_dir / "b.jpg"
+  p3 = tmp_dir / "c.bmp"
+  output_path = tmp_dir / "combined.pdf"
+  create_test_png(p1, size=(100, 100))
+  create_test_jpg(p2, size=(120, 80))
+  create_test_bmp(p3, size=(60, 60))
+
+  result = await images_to_pdf(ctx, [str(p1), str(p2), str(p3)], str(output_path))
+  assert "Successfully combined 3 image(s)" in result
+  assert output_path.exists()
+
+  import pypdf
+  reader = pypdf.PdfReader(str(output_path))
+  assert len(reader.pages) == 3
+
+
+async def test_images_to_pdf_empty_list(ctx, tmp_dir):
+  result = await images_to_pdf(ctx, [], str(tmp_dir / "out.pdf"))
+  assert "at least one" in result.lower()
+
+
+async def test_images_to_pdf_missing_input(ctx, tmp_dir):
+  result = await images_to_pdf(
+    ctx, [str(tmp_dir / "missing.png")], str(tmp_dir / "out.pdf")
+  )
+  assert "not exist" in result.lower()
+
+
+async def test_images_to_pdf_creates_missing_dest_dir(ctx, tmp_dir):
+  input_path = tmp_dir / "test.png"
+  output_path = tmp_dir / "nested" / "dir" / "out.pdf"
+  create_test_png(input_path)
+
+  result = await images_to_pdf(ctx, [str(input_path)], str(output_path))
+  assert "Successfully combined" in result
+  assert output_path.exists()
+
+
+async def test_images_to_pdf_includes_svg(ctx, tmp_dir):
+  """SVG inputs must be rasterized before being combined into the PDF."""
+  if not (_CAIROSVG_AVAILABLE):
+    pytest.skip("cairosvg not installed")
+
+  png_path = tmp_dir / "a.png"
+  svg_path = tmp_dir / "b.svg"
+  output_path = tmp_dir / "out.pdf"
+  create_test_png(png_path)
+  create_test_svg(svg_path)
+
+  result = await images_to_pdf(ctx, [str(png_path), str(svg_path)], str(output_path))
+  assert "Successfully combined 2 image(s)" in result
+
+  import pypdf
+  reader = pypdf.PdfReader(str(output_path))
+  assert len(reader.pages) == 2
+
+
+# ---------------------------------------------------------------------------
+# pdf_to_images
+# ---------------------------------------------------------------------------
+
+def _create_test_pdf(path: pathlib.Path, page_sizes=((100, 100),)) -> None:
+  """Create a multi-page PDF from solid-color pages using Pillow."""
+  pages = [Image.new("RGB", size, (200, 50, 50)) for size in page_sizes]
+  first, rest = pages[0], pages[1:]
+  first.save(path, "PDF", save_all=True, append_images=rest)
+
+
+@pytest.mark.skipif(not _PYMUPDF_AVAILABLE, reason="PyMuPDF (fitz) not installed")
+async def test_pdf_to_images_single_page(ctx, tmp_dir):
+  pdf_path = tmp_dir / "doc.pdf"
+  dest_dir = tmp_dir / "pages"
+  _create_test_pdf(pdf_path, page_sizes=((200, 200),))
+
+  result = await pdf_to_images(ctx, str(pdf_path), str(dest_dir))
+  assert "Successfully rendered 1 page(s)" in result
+  assert (dest_dir / "doc_page_1.png").exists()
+
+
+@pytest.mark.skipif(not _PYMUPDF_AVAILABLE, reason="PyMuPDF (fitz) not installed")
+async def test_pdf_to_images_multi_page_naming(ctx, tmp_dir):
+  pdf_path = tmp_dir / "multi.pdf"
+  dest_dir = tmp_dir / "pages"
+  _create_test_pdf(pdf_path, page_sizes=((100, 100), (100, 100), (100, 100)))
+
+  result = await pdf_to_images(ctx, str(pdf_path), str(dest_dir))
+  assert "Successfully rendered 3 page(s)" in result
+  for i in (1, 2, 3):
+    assert (dest_dir / f"multi_page_{i}.png").exists()
+
+
+@pytest.mark.skipif(not _PYMUPDF_AVAILABLE, reason="PyMuPDF (fitz) not installed")
+async def test_pdf_to_images_jpg_format(ctx, tmp_dir):
+  pdf_path = tmp_dir / "doc.pdf"
+  dest_dir = tmp_dir / "pages"
+  _create_test_pdf(pdf_path)
+
+  result = await pdf_to_images(ctx, str(pdf_path), str(dest_dir), output_format="JPG")
+  assert "Successfully rendered 1 page(s)" in result
+  out_file = dest_dir / "doc_page_1.jpg"
+  assert out_file.exists()
+  with Image.open(out_file) as img:
+    assert img.format == "JPEG"
+
+
+@pytest.mark.skipif(not _PYMUPDF_AVAILABLE, reason="PyMuPDF (fitz) not installed")
+async def test_pdf_to_images_respects_dpi(ctx, tmp_dir):
+  """Higher DPI should produce a larger rendered pixmap."""
+  pdf_path = tmp_dir / "doc.pdf"
+  dest_lo = tmp_dir / "lo"
+  dest_hi = tmp_dir / "hi"
+  _create_test_pdf(pdf_path, page_sizes=((200, 200),))
+
+  await pdf_to_images(ctx, str(pdf_path), str(dest_lo), dpi=72)
+  await pdf_to_images(ctx, str(pdf_path), str(dest_hi), dpi=300)
+
+  with Image.open(dest_lo / "doc_page_1.png") as lo_img:
+    lo_size = lo_img.size
+  with Image.open(dest_hi / "doc_page_1.png") as hi_img:
+    hi_size = hi_img.size
+
+  assert hi_size[0] > lo_size[0]
+  assert hi_size[1] > lo_size[1]
+
+
+async def test_pdf_to_images_missing_input(ctx, tmp_dir):
+  result = await pdf_to_images(ctx, str(tmp_dir / "missing.pdf"), str(tmp_dir / "out"))
+  assert "not exist" in result.lower()
+
+
+async def test_pdf_to_images_unsupported_format(ctx, tmp_dir):
+  pdf_path = tmp_dir / "doc.pdf"
+  _create_test_pdf(pdf_path)
+  if not _PYMUPDF_AVAILABLE:
+    result = await pdf_to_images(ctx, str(pdf_path), str(tmp_dir / "out"), output_format="GIF")
+    assert "pymupdf" in result.lower()
+  else:
+    result = await pdf_to_images(ctx, str(pdf_path), str(tmp_dir / "out"), output_format="GIF")
+    assert "Unsupported output format" in result
+
+
+async def test_pdf_to_images_without_pymupdf(ctx, tmp_dir, monkeypatch):
+  """Without PyMuPDF installed, the tool returns a helpful install hint."""
+  import subconscious.desktop_tools.images as img_module
+  monkeypatch.setattr(img_module, "_PYMUPDF_AVAILABLE", False)
+
+  pdf_path = tmp_dir / "doc.pdf"
+  _create_test_pdf(pdf_path)
+
+  result = await pdf_to_images(ctx, str(pdf_path), str(tmp_dir / "out"))
+  assert "pymupdf" in result.lower()

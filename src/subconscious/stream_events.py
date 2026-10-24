@@ -8,6 +8,7 @@ multiple message bubbles
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Union
 
@@ -65,10 +66,116 @@ class ApprovalResolved:
   approved: bool
 
 
+@dataclass
+class TurnUsage:
+  """Token usage accumulated over a whole agent turn.
+
+  Emitted once, last, so a client can render an end-of-turn footnote ("12.3k
+  tokens"). Counts cover every model request the turn made, including the extra
+  round trips a tool-calling turn needs. Any field the provider didn't report is
+  ``0``.
+  """
+  input_tokens: int = 0
+  output_tokens: int = 0
+  total_tokens: int = 0
+  requests: int = 0
+
+
 # Discriminated union of everything the event stream can yield.
 StreamEvent = Union[
-  TextDelta, ToolCallStarted, ToolCallResult, ApprovalRequest, ApprovalResolved
+  TextDelta, ToolCallStarted, ToolCallResult, ApprovalRequest, ApprovalResolved, TurnUsage
 ]
+
+
+# ---------------------------------------------------------------------------
+# Attached-context stripping
+# ---------------------------------------------------------------------------
+
+# Preambles used when client-attached context is folded into a model prompt (see
+# ``Engine._with_context_blocks`` / ``Engine._build_prompt_with_attachments``).
+_CONTEXT_PREAMBLES = (
+  "The user attached the following context to this message.",
+  "The user has attached the following files and folders.",
+)
+
+# Separator placed between the attached context and the user's own message.
+_CONTEXT_SEPARATOR = "\n\n---\n\n"
+
+# A single client-resolved mention block, e.g. "[Context — File: src/main.ts]".
+_CONTEXT_BLOCK_PREFIX = "[Context"
+
+
+def strip_attached_context(text: str) -> str:
+  """Return *text* with any attached file/folder/terminal context removed, leaving
+  just what the user actually wrote.
+
+  Used for deriving a thread's automatic name: attached context is inlined at the
+  START of the text, so a naive "first few words" title on a message with an
+  attachment produced useless names like ``"[Context - File."`` instead of naming
+  the user's actual request.
+
+  Two forms are handled, in order:
+
+  1. A whole-prompt preamble ("The user attached the following context...") followed
+     by the ``---`` separator — everything up to and including the last separator is
+     dropped.
+  2. Leading ``[Context ...]`` blocks (the per-mention form), skipped line-wise while
+     respecting fenced code blocks so a fence's blank lines don't end the skip early.
+  3. Inline mentions like ``#filename`` at the start of the message are also stripped
+     since they don't contribute to the user's actual request.
+
+  Returns the original text when it carries no recognisable attached context, and
+  falls back to the original when stripping would leave nothing behind.
+  """
+  if not text:
+    return text
+
+  working = text.lstrip()
+
+  if working.startswith(_CONTEXT_PREAMBLES) and _CONTEXT_SEPARATOR in working:
+    working = working.rsplit(_CONTEXT_SEPARATOR, 1)[1]
+
+  lines = working.split("\n")
+  index = 0
+  in_fence = False
+  skipping = False
+  while index < len(lines):
+    line = lines[index]
+    stripped_line = line.strip()
+
+    if skipping:
+      if stripped_line.startswith("```"):
+        in_fence = not in_fence
+        index += 1
+        continue
+      if not in_fence and stripped_line == "":
+        skipping = False
+      index += 1
+      continue
+
+    if stripped_line == "":
+      index += 1
+      continue
+    if stripped_line.startswith(_CONTEXT_BLOCK_PREFIX):
+      skipping = True
+      index += 1
+      continue
+    break
+
+  remainder = "\n".join(lines[index:]).strip()
+  
+  # Also strip leading mentions like #filename from the start of the remainder
+  # These are inserted inline in the composer as "#filename " and don't contribute
+  # to the user's actual request content
+  while remainder and remainder.lstrip().startswith("#"):
+    # Find the end of the mention token (ends at whitespace or end of string)
+    match = re.match(r'^(#\S*\s*)(.*)', remainder.lstrip(), re.DOTALL)
+    if match:
+      remainder = match.group(2).strip()
+    else:
+      break
+
+  return remainder if remainder else text.strip()
 
 
 def _coerce_jsonable(value: Any) -> Any:

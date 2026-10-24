@@ -35,6 +35,7 @@ LOGO = """
 ⠀⠀⠀⠀⠀⠀⢀⣀⣀⣠⣾⠟⠁⢸⣿⠀⠀⠀⠉⠙⣿⣿⣿⣿⠆⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⢠⣿⣿⣿⣿⠁⠀⢀⣼⣿⡀⠀⠀⢀⣠⣿⠿⠟⠋⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠈⠿⣿⡿⠿⠿⢷⣿⣿⣿⣿⣶⠿⠟⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⠿⠿⠛⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 """
 
 def get_default_data_dir() -> pathlib.Path:
@@ -52,6 +53,16 @@ def get_default_data_dir() -> pathlib.Path:
 
 
 @dataclass
+class PeerApprovalConfig:
+  """ This Engine's own gate for tool calls it is asked to execute on behalf
+      of a Peer_Engine — configured locally, never influenced by the
+      requesting Master_Engine. """
+
+  query_requires_approval: bool = False
+  mutation_requires_approval: bool = True
+
+
+@dataclass
 class Config:
   api: bool = True
   dev: bool = False
@@ -60,6 +71,8 @@ class Config:
   node_id: Optional[str] = None
   secrets: Optional[dict] = None
   data_dir: pathlib.Path = field(default_factory=get_default_data_dir)
+  peer_grace_period_seconds: float = 30.0
+  peer_approval: PeerApprovalConfig = field(default_factory=PeerApprovalConfig)
 
   def __post_init__(self):
     if self.dev:
@@ -75,6 +88,13 @@ class Config:
         if data:
           self.node_id = data.get('node_id', self.node_id)
           self.secrets = data.get('secrets', self.secrets)
+          self.peer_grace_period_seconds = data.get('peer_grace_period_seconds', self.peer_grace_period_seconds)
+          peer_approval = data.get('peer_approval')
+          if peer_approval:
+            self.peer_approval = PeerApprovalConfig(
+              query_requires_approval=peer_approval.get('query_requires_approval', self.peer_approval.query_requires_approval),
+              mutation_requires_approval=peer_approval.get('mutation_requires_approval', self.peer_approval.mutation_requires_approval),
+            )
     else:
       # Create a config file
       logger.info(f"No config file found at {path}. Creating one...")
@@ -91,6 +111,11 @@ class Config:
       yaml.safe_dump({
         'node_id': str(self.node_id),
         'secrets': self.secrets,
+        'peer_grace_period_seconds': self.peer_grace_period_seconds,
+        'peer_approval': {
+          'query_requires_approval': self.peer_approval.query_requires_approval,
+          'mutation_requires_approval': self.peer_approval.mutation_requires_approval,
+        },
       }, f)
 
   @property

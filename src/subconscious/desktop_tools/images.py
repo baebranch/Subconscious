@@ -56,6 +56,21 @@ except ImportError:
   _vtracer = None  # type: ignore[assignment]
   _VTRACER_AVAILABLE = False
 
+# PyMuPDF ("fitz") renders PDF pages to raster images. It is optional and
+# lazily imported like the other heavy converters above.
+#
+# LICENSE NOTE: PyMuPDF is dual-licensed AGPL-3.0 / commercial (Artifex). AGPL
+# is a much stronger copyleft than the LGPL packages already tracked in
+# LGPL_COMPLIANCE.md — review/clear this with a commercial license (or swap to
+# a non-AGPL renderer such as pdf2image+poppler) before shipping a build that
+# bundles it.
+try:
+  import fitz as _fitz  # PyMuPDF
+  _PYMUPDF_AVAILABLE = True
+except ImportError:
+  _fitz = None  # type: ignore[assignment]
+  _PYMUPDF_AVAILABLE = False
+
 if platform.system() == 'Windows':
   try:
     import nocairosvg as _nocairosvg
@@ -126,10 +141,11 @@ def _optimize_svg_bytes(svg_bytes: bytes) -> bytes:
     options.shorten_ids = True
     options.indent_type = "none"
     options.newlines = False
-    in_stream = io.BytesIO(svg_bytes)
-    out_stream = io.BytesIO()
-    _scour.start(options, in_stream, out_stream)  # type: ignore[union-attr]
-    return out_stream.getvalue()
+    # Use scourString directly rather than start(): start() expects file-like
+    # objects with a .name attribute (for its summary log) and closes them
+    # afterward, which breaks in-memory BytesIO streams.
+    out_string = _scour.scourString(svg_bytes.decode("utf-8"), options)  # type: ignore[union-attr]
+    return out_string.encode("utf-8")
 
   # Lightweight fallback: strip XML comments
   import re
@@ -756,6 +772,153 @@ async def batch_resize_images(
     return f"Error in batch resize: {e}"
 
 
+async def images_to_pdf(
+  ctx: RunContext[EngineContext],
+  input_paths: list[str],
+  output_path: str,
+) -> str:
+  """
+  Combine one or more images into a single multi-page PDF, in the given order.
+
+  Each input image becomes one PDF page sized to that image's pixel dimensions.
+  SVG inputs are rendered to raster first (requires ``cairosvg``/``nocairosvg``
+  on Windows) since PDF pages here are raster.
+
+  Supported input formats: JPG, JPEG, PNG, BMP, TIFF, GIF, WebP, ICO, SVG.
+
+  Args:
+      input_paths: Ordered list of image file paths to combine, one per page.
+      output_path: Path for the resulting PDF file.
+
+  Returns:
+      Success message or error description.
+  """
+  try:
+    if not input_paths:
+      return "Error: input_paths must contain at least one image."
+
+    output_p = pathlib.Path(output_path).expanduser().resolve()
+    output_p.parent.mkdir(parents=True, exist_ok=True)
+
+    pages: list[Image.Image] = []
+    try:
+      for raw_path in input_paths:
+        input_p = pathlib.Path(raw_path).expanduser().resolve()
+        if not input_p.exists() or not input_p.is_file():
+          return f"Error: Input file '{raw_path}' does not exist or is not a file."
+
+        if _is_svg(input_p):
+          data, err = _svg_to_raster_bytes(input_p, "PNG")
+          if err:
+            return f"Error: {err}"
+          img = Image.open(io.BytesIO(data))  # type: ignore[arg-type]
+        else:
+          img = Image.open(input_p)
+
+        if img.mode in ("RGBA", "P", "LA"):
+          img = img.convert("RGB")
+        elif img.mode not in ("RGB", "L"):
+          img = img.convert("RGB")
+        pages.append(img)
+
+      first, rest = pages[0], pages[1:]
+      first.save(output_p, "PDF", save_all=True, append_images=rest)
+    finally:
+      for img in pages:
+        img.close()
+
+    return (
+      f"Successfully combined {len(input_paths)} image(s) into PDF "
+      f"at '{output_path}'."
+    )
+
+  except Exception as e:
+    logger.error(f"Error converting images to PDF: {e}")
+    return f"Error converting images to PDF: {e}"
+
+
+async def pdf_to_images(
+  ctx: RunContext[EngineContext],
+  input_path: str,
+  dest_directory: str,
+  output_format: str = "PNG",
+  dpi: int = 150,
+) -> str:
+  """
+  Render each page of a PDF to a separate raster image file.
+
+  Requires ``PyMuPDF`` (``pip install pymupdf``, module name ``fitz``).
+
+  Note: PyMuPDF is dual-licensed AGPL-3.0 / commercial. Confirm licensing
+  terms are acceptable for your distribution before relying on this tool in a
+  shipped build.
+
+  Output files are named ``<pdf-stem>_page_<n>.<ext>`` (1-indexed) inside
+  *dest_directory*.
+
+  Supported output formats: PNG, JPG, BMP, TIFF, WebP.
+
+  Args:
+      input_path: Path to the input PDF file.
+      dest_directory: Directory to write the rendered page images into.
+      output_format: Desired image format for each page (default 'PNG').
+      dpi: Render resolution in dots per inch (default 150; higher = larger/sharper).
+
+  Returns:
+      Success message listing the number of pages rendered, or an error description.
+  """
+  if not _PYMUPDF_AVAILABLE:
+    return (
+      "PDF to image conversion requires 'PyMuPDF'. Install it with: "
+      "pip install pymupdf  "
+      "(Note: PyMuPDF is AGPL-3.0/commercial dual-licensed — review licensing "
+      "terms before shipping.)"
+    )
+
+  try:
+    input_p = pathlib.Path(input_path).expanduser().resolve()
+    if not input_p.exists() or not input_p.is_file():
+      return f"Error: Input file '{input_path}' does not exist or is not a file."
+
+    output_format = output_format.upper()
+    supported_outputs = {'JPG', 'JPEG', 'PNG', 'BMP', 'TIFF', 'WEBP'}
+    if output_format not in supported_outputs:
+      return f"Error: Unsupported output format '{output_format}'. Supported: {', '.join(sorted(supported_outputs))}"
+    ext = '.jpg' if output_format in ('JPG', 'JPEG') else f'.{output_format.lower()}'
+    pil_format = 'JPEG' if output_format in ('JPG', 'JPEG') else output_format
+
+    dest_p = pathlib.Path(dest_directory).expanduser().resolve()
+    dest_p.mkdir(parents=True, exist_ok=True)
+
+    stem = input_p.stem
+    page_count = 0
+    doc = _fitz.open(str(input_p))  # type: ignore[union-attr]
+    try:
+      for i, page in enumerate(doc, start=1):
+        pix = page.get_pixmap(dpi=dpi)
+        png_bytes = pix.tobytes("png")
+        out_file = dest_p / f"{stem}_page_{i}{ext}"
+        if output_format == "PNG":
+          out_file.write_bytes(png_bytes)
+        else:
+          with Image.open(io.BytesIO(png_bytes)) as img:
+            if pil_format == "JPEG" and img.mode in ("RGBA", "P"):
+              img = img.convert("RGB")
+            img.save(out_file, pil_format)
+        page_count += 1
+    finally:
+      doc.close()
+
+    return (
+      f"Successfully rendered {page_count} page(s) from '{input_path}' "
+      f"to '{dest_directory}' as {output_format}."
+    )
+
+  except Exception as e:
+    logger.error(f"Error converting PDF to images: {e}")
+    return f"Error converting PDF to images: {e}"
+
+
 TOOLS = [
   optimize_image,
   convert_image,
@@ -763,4 +926,6 @@ TOOLS = [
   batch_optimize_images,
   batch_convert_image,
   batch_resize_images,
+  images_to_pdf,
+  pdf_to_images,
 ]

@@ -38,6 +38,7 @@ _MUTATION_TOOLS = frozenset({
   # images (write output files)
   "optimize_image", "convert_image", "batch_optimize_images",
   "batch_convert_image", "resize_image", "batch_resize_images",
+  "images_to_pdf", "pdf_to_images",
   # filesystem
   "create_file", "move_to_trash", "replace_in_file",
   # clipboard
@@ -113,6 +114,14 @@ class EngineContext:
   # Resolved human-in-the-loop approval policy for this run:
   # {"query": bool, "mutation": bool} where True == approval required.
   approval_config: dict = field(default_factory=lambda: {"query": True, "mutation": True})
+  # Per-turn Provider_Table-backed tool dispatcher, injected by the WebSocket
+  # `chat.send` handler (single-engine-architecture spec, task 11.2). When set,
+  # it is an ``async (tool_id, input) -> ToolResult-dict`` callable that routes
+  # a tool call through the Master_Engine's fresh ``ProviderTable.snapshot()``
+  # via ``ToolDispatcher.call`` — replacing the legacy direct single-client
+  # tool-call path. ``None`` on in-process (desktop/CLI) turns that have no
+  # connected Provider clients.
+  tool_dispatch: Any = None
 
 
 # ---------------------------------------------------------------------------

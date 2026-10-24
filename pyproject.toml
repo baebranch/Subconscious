@@ -68,7 +68,12 @@ test = [
 ]
 images = [
   "cairosvg",
-  "vtracer"
+  "vtracer",
+  # pdf_to_images (PDF -> raster). NOTE: PyMuPDF is dual-licensed
+  # AGPL-3.0/commercial (Artifex) — confirm licensing terms before shipping a
+  # build that bundles it; see LGPL_COMPLIANCE.md for how other optional
+  # copyleft deps are handled.
+  "pymupdf"
 ]
 rag = [
   # Optional accelerators for the RAG stack. The default indexer/retriever work

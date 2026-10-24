@@ -1,21 +1,9 @@
+""" Braille generator """
 import sys
+import argparse
 from PIL import Image
+from pathlib import Path
 
-# Text Generator
-# https://patorjk.com/software/taag/#p=display&f=ANSI+Shadow&t=Subconscious&x=none&v=4&h=4&w=80&we=false
-
-# Terminal Encoding Setup
-  # Attempt to set console encoding to UTF-8 for Windows
-  # if sys.platform == "win32":
-  #   try:
-  #     import ctypes
-  #     # 65001 is the Windows code page for UTF-8
-  #     ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-  #     ctypes.windll.kernel32.SetConsoleCP(65001)
-  #     sys.stdout.reconfigure(encoding='utf-8')
-  #     sys.stderr.reconfigure(encoding='utf-8')
-  #   except Exception:
-  #     pass
 
 r = "⠀⠁⠂⠃⠄⠅⠆⠇⠈⠉⠊⠋⠌⠍⠎⠏⠐⠑⠒⠓⠔⠕⠖⠗⠘⠙⠚⠛⠜⠝⠞⠟⠠⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿⡀⡁⡂⡃⡄⡅⡆⡇⡈⡉⡊⡋⡌⡍⡎⡏⡐⡑⡒⡓⡔⡕⡖⡗⡘⡙⡚⡛⡜⡝⡞⡟⡠⡡⡢⡣⡤⡥⡦⡧⡨⡩⡪⡫⡬⡭⡮⡯⡰⡱⡲⡳⡴⡵⡶⡷⡸⡹⡺⡻⡼⡽⡾⡿⢀⢁⢂⢃⢄⢅⢆⢇⢈⢉⢊⢋⢌⢍⢎⢏⢐⢑⢒⢓⢔⢕⢖⢗⢘⢙⢚⢛⢜⢝⢞⢟⢠⢡⢢⢣⢤⢥⢦⢧⢨⢩⢪⢫⢬⢭⢮⢯⢰⢱⢲⢳⢴⢵⢶⢷⢸⢹⢺⢻⢼⢽⢾⢿⣀⣁⣂⣃⣄⣅⣆⣇⣈⣉⣊⣋⣌⣍⣎⣏⣐⣑⣒⣓⣔⣕⣖⣗⣘⣙⣚⣛⣜⣝⣞⣟⣠⣡⣢⣣⣤⣥⣦⣧⣨⣩⣪⣫⣬⣭⣮⣯⣰⣱⣲⣳⣴⣵⣶⣷⣸⣹⣺⣻⣼⣽⣾⣿"
 
@@ -68,12 +56,26 @@ def image_to_braille(image_path, width=80, invert=False, threshold=128):
     return "\n".join(output)
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser(description="Convert images to Braille art.")
     parser.add_argument("image", help="Path to the image file")
     parser.add_argument("width", type=int, nargs="?", default=80, help="Width in Braille characters")
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="Write Braille art to this UTF-8 text file instead of the terminal",
+    )
     parser.add_argument("--invert", action="store_true", help="Invert the output")
     parser.add_argument("--threshold", type=int, default=128, help="Luminance/Alpha threshold (0-255)")
-    
+
     args = parser.parse_args()
-    print(image_to_braille(args.image, args.width, args.invert, args.threshold))
+    braille_art = image_to_braille(args.image, args.width, args.invert, args.threshold)
+
+    if args.output is None:
+        print(braille_art)
+    else:
+        try:
+            args.output.write_text(f"{braille_art}\n", encoding="utf-8", newline="\n")
+        except OSError as error:
+            parser.error(f"Could not write output file '{args.output}': {error}")
+        print(f"Wrote Braille art to {args.output}", file=sys.stderr)

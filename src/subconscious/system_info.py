@@ -23,7 +23,6 @@ from concurrent.futures import ThreadPoolExecutor
 UNKNOWN = "unknown"
 PROBE_TIMEOUT_SECONDS = 2.0
 COLLECTION_BUDGET_SECONDS = 30.0
-STORAGE_PROBE_TIMEOUT_SECONDS = 8.0
 SYSTEM_INFO_FILENAME = "system_profile.json"
 logger = logging.getLogger("subconscious")
 
@@ -35,7 +34,6 @@ class StaticMetrics:
       Byte-valued fields (``total_ram_bytes``, ``total_vram_bytes``) are stored as
       raw byte counts in string form; conversion to GB happens only at format time.
   """
-  storage: str = UNKNOWN
   cpu_model: str = UNKNOWN
   gpu_model: str = UNKNOWN
   accelerator: str = UNKNOWN
@@ -50,7 +48,6 @@ class StaticMetrics:
 class OSMetrics:
   """ Operating-system and runtime metrics """
   os_name: str = UNKNOWN
-  os_build: str = UNKNOWN
   os_version: str = UNKNOWN
   python_version: str = UNKNOWN
   machine_architecture: str = UNKNOWN
@@ -164,7 +161,6 @@ class SystemInformationService:
     python_version = gather(self._probe_python_version)
     machine_architecture = gather(self._probe_machine_architecture)
     os_name = gather(self._probe_os_name, timeout=PROBE_TIMEOUT_SECONDS)
-    os_build = gather(self._probe_os_build, timeout=PROBE_TIMEOUT_SECONDS)
 
     # --- Expensive, shell-based metrics last -------------------------------
     # GPU / VRAM / accelerator are derived from a single guarded probe so the
@@ -176,13 +172,7 @@ class SystemInformationService:
     total_vram_bytes = self._normalize_vram(gpu_raw.get("vram_bytes"))
     accelerator = self._safe(lambda: gpu_raw.get("accelerator"))
 
-    # Storage detection shells out (e.g. PowerShell Get-PhysicalDisk) with a
-    storage = gather(
-      self._probe_storage, timeout=STORAGE_PROBE_TIMEOUT_SECONDS + 2.0
-    )
-
     static = StaticMetrics(
-      storage=storage,
       cpu_model=cpu_model,
       gpu_model=gpu_model,
       accelerator=accelerator,
@@ -195,7 +185,6 @@ class SystemInformationService:
 
     os_metrics = OSMetrics(
       os_name=os_name,
-      os_build=os_build,
       os_version=os_version,
       python_version=python_version,
       machine_architecture=machine_architecture,
@@ -208,7 +197,7 @@ class SystemInformationService:
   # ---------------------------------------------------------------------
 
   # Serialization schema version for the System_Info_File (Requirement 3.2).
-  _SCHEMA_VERSION = 2
+  _SCHEMA_VERSION = 1
 
   def _read_file(self) -> Optional[SystemProfile]:
     """Read and JSON-parse the ``System_Info_File`` into a ``SystemProfile``.
@@ -227,9 +216,6 @@ class SystemInformationService:
       return None
 
     if not isinstance(data, dict):
-      return None
-
-    if data.get("version") != self._SCHEMA_VERSION:
       return None
 
     static_raw = data.get("static")
@@ -420,7 +406,6 @@ class SystemInformationService:
         "which local models can run and to give system-aware answers.",
         "",
         f"Operating System: {os_metrics.os_name} (version {os_metrics.os_version})",
-        f"OS Build: {os_metrics.os_build}",
         f"Architecture: {os_metrics.machine_architecture} / {static.cpu_architecture}",
         f"Python Runtime: {os_metrics.python_version}",
         "",
@@ -432,7 +417,6 @@ class SystemInformationService:
         f"GPU: {static.gpu_model}",
         f"Total VRAM: {self._format_bytes_as_gb(static.total_vram_bytes)}",
         f"Accelerator: {static.accelerator}",
-        f"Storage: {static.storage}",
         "</system_information>",
       ]
       return "\n".join(lines)
@@ -581,93 +565,6 @@ class SystemInformationService:
   def _probe_cpu_architecture(self) -> Any:
     """CPU / instruction-set architecture (e.g. ``x86_64``, ``arm64``)."""
     return platform.machine()
-
-  # ---------------------------------------------------------------------
-  # Storage probes (best-effort, platform-dispatched)
-  # ---------------------------------------------------------------------
-
-  def _probe_storage(self) -> Any:
-    """ Summarize physical drives as ``<name> (<type>, <size>)`` entries.
-    """
-    system = platform.system()
-    if system == "Windows":
-      drives = self._probe_storage_windows()
-    elif system == "Linux":
-      drives = self._probe_storage_linux()
-    elif system == "Darwin":
-      drives = self._probe_storage_macos()
-    else:
-      drives = []
-    return "; ".join(drives) if drives else None
-
-  def _probe_storage_windows(self) -> list:
-    """Physical drives on Windows via PowerShell ``Get-PhysicalDisk``."""
-    out = self._run_command([
-      "powershell", "-NoProfile", "-Command",
-      "Get-PhysicalDisk | ForEach-Object "
-      "{ \"$($_.FriendlyName)|$($_.MediaType)|$($_.Size)\" }",
-    ], timeout=STORAGE_PROBE_TIMEOUT_SECONDS)
-    drives = []
-    for line in out.splitlines():
-      parts = [p.strip() for p in line.split("|")]
-      if not parts or not any(parts):
-        continue
-      name = parts[0] or "Drive"
-      media = parts[1] if len(parts) > 1 and parts[1] else UNKNOWN
-      size = ""
-      if len(parts) > 2 and parts[2].isdigit():
-        size = self._format_bytes_as_gb(parts[2])
-      drives.append(self._format_drive(name, media, size))
-    return drives
-
-  def _probe_storage_linux(self) -> list:
-    """Physical drives on Linux via ``lsblk`` (ROTA distinguishes HDD/SSD)."""
-    out = self._run_command(
-      ["lsblk", "-d", "-b", "-n", "-o", "NAME,ROTA,SIZE,TYPE"],
-      timeout=STORAGE_PROBE_TIMEOUT_SECONDS,
-    )
-    drives = []
-    for line in out.splitlines():
-      cols = line.split()
-      if len(cols) < 4 or cols[3] != "disk":
-        continue
-      name, rota, size = cols[0], cols[1], cols[2]
-      media = "HDD" if rota == "1" else "SSD"
-      size_str = self._format_bytes_as_gb(size) if size.isdigit() else ""
-      drives.append(self._format_drive(name, media, size_str))
-    return drives
-
-  def _probe_storage_macos(self) -> list:
-    """Physical drives on macOS via ``system_profiler SPStorageDataType``."""
-    out = self._run_command(
-      ["system_profiler", "SPStorageDataType"],
-      timeout=STORAGE_PROBE_TIMEOUT_SECONDS,
-    )
-    drives = []
-    name = ""
-    size = ""
-    for line in out.splitlines():
-      stripped = line.strip()
-      if stripped.endswith(":") and not line.startswith(" " * 8):
-        if name:
-          drives.append(self._format_drive(name, UNKNOWN, size))
-        name = stripped.rstrip(":")
-        size = ""
-      elif stripped.startswith("Capacity:"):
-        # e.g. "Capacity: 500.28 GB (500,277,792,768 bytes)"
-        raw = stripped.split(":", 1)[1].strip()
-        size = raw.split("(")[0].strip()
-    if name:
-      drives.append(self._format_drive(name, UNKNOWN, size))
-    return drives
-
-  @staticmethod
-  def _format_drive(name: str, media: str, size: str) -> str:
-    """ Render one drive as ``name (media, size)``, omitting blank parts """
-    details = [d for d in (media, size) if d and d != UNKNOWN]
-    if details:
-      return f"{name} ({', '.join(details)})"
-    return name
 
   # ---------------------------------------------------------------------
   # GPU / VRAM / accelerator probes (best-effort, platform-dispatched)
@@ -857,35 +754,6 @@ class SystemInformationService:
   def _probe_os_version(self) -> Any:
     """Operating-system version string."""
     return platform.version()
-
-  def _probe_os_build(self) -> Any:
-    """Operating-system build identifier.
-
-    On Windows this is the build number (e.g. ``22631``); on macOS the build
-    version from ``sw_vers`` (e.g. ``23G93``); on Linux the distro ``BUILD_ID``
-    from ``/etc/os-release`` when present, else the kernel release.
-    """
-    system = platform.system()
-    if system == "Windows":
-      # platform.version() is "10.0.<build>"; the last component is the build.
-      version = platform.version() or ""
-      parts = version.split(".")
-      if len(parts) >= 3 and parts[-1].isdigit():
-        return parts[-1]
-      return version or None
-    if system == "Darwin":
-      build = self._run_command(["sw_vers", "-buildVersion"])
-      return build or None
-    if system == "Linux":
-      try:
-        with open("/etc/os-release", "r", encoding="utf-8", errors="ignore") as handle:
-          for line in handle:
-            if line.startswith("BUILD_ID="):
-              return line.split("=", 1)[1].strip().strip('"')
-      except OSError:
-        pass
-      return platform.release() or None
-    return platform.release() or None
 
   def _probe_machine_architecture(self) -> Any:
     """Machine architecture as reported by the OS (e.g. ``AMD64``)."""
